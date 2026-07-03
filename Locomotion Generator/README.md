@@ -223,25 +223,15 @@ The renderer displays:
 
 ## Controls
 
-
-
 | Control | Function |
-
-|---------|----------|
-
+|----------|----------|
 | Height Slider | Adjust chassis height |
-
 | Forward | Move body forward |
-
 | Back | Move body backward |
-
 | Left | Move body left |
-
 | Right | Move body right |
-
-| Stance | Reset to stable stance |
-
-| Walk | Enable continuous walking |
+| Stance | Reset the robot to a stable stance |
+| Walk | Enable continuous walking mode |
 
 
 
@@ -298,49 +288,33 @@ The renderer displays:
 Configuration
 
 │
-
 ├── Robot Geometry
-
 ├── Joint Limits
-
 ├── Workspace Parameters
-
 │
 
 Inverse Kinematics
 
 │
-
 ├── Reachability
-
 ├── Knee Solver
-
 ├── Roll Constraints
-
 │
 
 Motion Planning
 
 │
-
 ├── Reactive Stepping
-
 ├── Continuous Walking
-
 ├── Stability Correction
-
 │
 
 Visualization
 
 │
-
 ├── Chassis
-
 ├── Legs
-
 ├── Support Polygon
-
 └── GUI Controls
 
 ```
