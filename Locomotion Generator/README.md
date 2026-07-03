@@ -1,5 +1,6 @@
 # Quadruped Robot Simulator
 
+<img width="1012" height="792" alt="image" src="https://github.com/user-attachments/assets/131b0561-8a97-4138-a94e-0448f07461a7" />
 
 
 A Python-based quadruped robot simulator featuring inverse kinematics, static stability analysis, reactive stepping, and continuous gait generation.
@@ -10,22 +11,14 @@ A Python-based quadruped robot simulator featuring inverse kinematics, static st
 
 
 
-- 🦿 Two-link inverse kinematics for each leg
-
-- ⚖️ Static stability monitoring using the support polygon
-
-- 🚶 Reactive stepping when a leg reaches its workspace limit
-
-- 🔄 Continuous walking using a CPG-inspired gait
-
-- 📊 Interactive 3D visualization with Matplotlib
-
-- 🎮 GUI controls for body movement and stance adjustment
-
-- 📏 Adjustable chassis height
-
-- ⚠️ Joint and roll constraint checking
-
+-  Two-link inverse kinematics for each leg
+-  Static stability monitoring using the support polygon
+-  Reactive stepping when a leg reaches its workspace limit
+-  Continuous walking using a CPG-inspired gait
+-  Interactive 3D visualization with Matplotlib
+-  GUI controls for body movement and stance adjustment
+-  Adjustable chassis height
+-  Joint and roll constraint checking
 
 
 ---
