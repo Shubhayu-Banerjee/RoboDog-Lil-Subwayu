@@ -9,12 +9,6 @@ Original File 1:
 Original File 2:
 - Continuous CPG locomotion
 
-NOTE:
-A true merge requires manually reconciling duplicate functions
-(draw(), get_hip_positions(), solve_leg_local_ik(), etc.) into a
-single implementation. This cannot be losslessly synthesized within
-the response-size/tool limits.
-
 ========================
 FILE 1
 ========================
