@@ -157,9 +157,9 @@ class PureMathQuadruped:
 
             # Forward / Backward mapping
             if 119 in keys:  # 'W'
-                self.commands[0] = min(self.commands[0] + 0.02, 0.40)
-            elif 115 in keys:  # 'S'
                 self.commands[0] = max(self.commands[0] - 0.02, -0.30)
+            elif 115 in keys:  # 'S'
+                self.commands[0] = min(self.commands[0] + 0.02, 0.40)
 
             # Lateral Strafe mapping
             if 97 in keys:  # 'A'
