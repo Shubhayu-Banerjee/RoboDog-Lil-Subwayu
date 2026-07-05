@@ -18,17 +18,21 @@ class PureMathQuadruped:
             cameraDistance=0.9, cameraYaw=50, cameraPitch=-25, cameraTargetPosition=[0, 0, 0.18]
         )
 
-        # Robot Geometry (As requested: 10cm Thigh, 12cm Shin)
+        # Robot Geometry
         self.l1 = 0.10  # Thigh link length (meters)
         self.l2 = 0.12  # Shin link length (meters)
         self.hip_offset_y = 0.055  # Lateral width separation of hip joint
 
-        # Stance configurations
-        self.default_z = -0.17  # Default standing height relative to hip axis
-        self.cpg_time = 0.0
-        self.gait_frequency = 2.0  # 2.0 Hz stepping rate (cycles per second)
+        # Interactive UI Sliders for Body Pose & Height
+        self.height_slider = pyb.addUserDebugParameter("Body Height", -0.25, -0.05, -0.17)
+        self.roll_slider = pyb.addUserDebugParameter("Body Roll", -0.4, 0.4, 0.0)
+        self.pitch_slider = pyb.addUserDebugParameter("Body Pitch", -0.4, 0.4, 0.0)
+        self.yaw_slider = pyb.addUserDebugParameter("Static Body Yaw", -0.5, 0.5, 0.0)
 
-        # Interactive Vector Commands: [Forward/Backward, Left/Right Strafe, Yaw Turn Rate]
+        self.cpg_time = 0.0
+        self.gait_frequency = 2.0  # 2.0 Hz stepping rate
+
+        # Interactive Vector Commands: [Forward/Backward, Left/Right Strafe, Dynamic Yaw]
         self.commands = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
         self._setup_world()
@@ -86,55 +90,67 @@ class PureMathQuadruped:
         return hip_roll, thigh_pitch, calf_knee
 
     def update_gait(self):
-        """CPG Engine calculates clean alternating elliptical paths in all vector directions"""
-        self.cpg_time += 1.0 / 60.0  # Increment master loop clock execution time
+        """CPG Engine handles walking paths, with Z-axis extension overrides for body pose"""
+        self.cpg_time += 1.0 / 60.0
         omega = 2.0 * math.pi * self.gait_frequency
 
-        # Extract targeted velocities from vector command registry
+        # Read Slider States for Body Pose
+        body_h = pyb.readUserDebugParameter(self.height_slider)
+        b_roll = pyb.readUserDebugParameter(self.roll_slider)
+        b_pitch = pyb.readUserDebugParameter(self.pitch_slider)
+        b_yaw = pyb.readUserDebugParameter(self.yaw_slider)
+
         v_x = self.commands[0]
         v_y = self.commands[1]
         w_yaw = self.commands[2]
 
-        # Dynamically scale trajectory limits based on speed parameters
         stride_x = v_x * 0.12
         stride_y = v_y * 0.10
         step_height = 0.05 if (abs(v_x) > 0.01 or abs(v_y) > 0.01 or abs(w_yaw) > 0.01) else 0.0
 
-        # Define 180-degree phase shift splits for diagonal trot pacing pairs
-        # Leg ordering standard: 0=FL, 1=FR, 2=BL, 3=BR
+        # Leg phase standard: 0=FL, 1=FR, 2=BL, 3=BR
         phases = [
-            omega * self.cpg_time,  # FL Pair A
-            omega * self.cpg_time + math.pi,  # FR Pair B
-            omega * self.cpg_time + math.pi,  # BL Pair B
-            omega * self.cpg_time  # BR Pair A
+            omega * self.cpg_time,
+            omega * self.cpg_time + math.pi,
+            omega * self.cpg_time + math.pi,
+            omega * self.cpg_time
         ]
 
-        # Coordinates defining nominal resting centers for each hip link bracket
-        # FL, FR, BL, BR respectively
         base_x = [0.12, 0.12, -0.12, -0.12]
         base_y = [self.hip_offset_y, -self.hip_offset_y, self.hip_offset_y, -self.hip_offset_y]
 
         for i in range(4):
             p = phases[i]
 
-            # Calculate base tracking paths along the forward and lateral axes
-            x_target = stride_x * math.cos(p)
-            y_target = stride_y * math.cos(p)
+            # Dynamic walking trajectories
+            x_step = stride_x * math.cos(p)
+            y_step = stride_y * math.cos(p)
+            z_step = step_height * max(0.0, math.sin(p))
 
-            # Vertical foot clearance lifting parabola profile
-            z_target = self.default_z + (step_height * max(0.0, math.sin(p)))
+            # Dynamic turning arcs (for moving)
+            dynamic_yaw_rx = base_y[i]
+            dynamic_yaw_ry = -base_x[i]
+            x_step += w_yaw * dynamic_yaw_rx * 0.4 * math.cos(p)
+            y_step += w_yaw * dynamic_yaw_ry * 0.4 * math.cos(p)
 
-            # APPLY DIFFERENTIAL YAW: Mixes turning angles directly into the foot vectors
-            # Inner/Outer legs scale proportionally to trace a clean geometric arc path
-            yaw_radius_x = base_y[i]
-            yaw_radius_y = -base_x[i]
-            x_target += w_yaw * yaw_radius_x * 0.4 * math.cos(p)
-            y_target += w_yaw * yaw_radius_y * 0.4 * math.cos(p)
+            # --- THE EXTENSION FIX ---
+            # 1. Pitch & Roll: Modify ONLY the Z-axis extension so the legs don't push horizontally
+            pitch_z_extension = base_x[i] * math.tan(b_pitch)
+            roll_z_extension = -base_y[i] * math.tan(b_roll)
 
-            # Map the clean Cartesian position paths straight through Inverse Kinematics
-            hip, thigh, calf = self.analytical_ik(i, (x_target, y_target, z_target))
+            # 2. Static Yaw: Since legs can't extend sideways, we must calculate the exact counter-shift
+            # to keep the feet planted perfectly in place while the hips rotate around the COG.
+            static_yaw_x = -(base_x[i] * (math.cos(b_yaw) - 1.0) - base_y[i] * math.sin(b_yaw))
+            static_yaw_y = -(base_x[i] * math.sin(b_yaw) + base_y[i] * (math.cos(b_yaw) - 1.0))
 
-            # Send position coordinates down to the high-torque hardware servos
+            # Combine all coordinates into the local hip frame
+            ik_x = x_step + static_yaw_x
+            ik_y = y_step + static_yaw_y
+            ik_z = body_h + z_step + pitch_z_extension + roll_z_extension
+
+            # Pass calculated lengths through Inverse Kinematics
+            hip, thigh, calf = self.analytical_ik(i, (ik_x, ik_y, ik_z))
+
             pyb.setJointMotorControl2(self.robot_id, i * 3, pyb.POSITION_CONTROL, targetPosition=hip, force=5.88)
             pyb.setJointMotorControl2(self.robot_id, i * 3 + 1, pyb.POSITION_CONTROL, targetPosition=thigh, force=5.88)
             pyb.setJointMotorControl2(self.robot_id, i * 3 + 2, pyb.POSITION_CONTROL, targetPosition=calf, force=5.88)
@@ -142,58 +158,53 @@ class PureMathQuadruped:
     def run_loop(self):
         print("\n=== PURE MATHEMATICAL JOYSTICK CONTROLLER ACTIVE ===")
         print("Click on the PyBullet simulation window to pilot:")
-        print("  [W] -> Shuffle Forward          [S] -> Shuffle Backward")
-        print("  [A] -> Strafe Left              [D] -> Strafe Right")
-        print("  [Q] -> Rotate Counter-Clockwise [E] -> Rotate Clockwise")
+        print("  [K] -> Shuffle Forward          [N] -> Shuffle Backward")
+        print("  [B] -> Strafe Left              [M] -> Strafe Right")
+        print("  [J] -> Rotate Counter-Clockwise [L] -> Rotate Clockwise")
         print("  [X] -> Full Stationary Brake / Pause Stance")
+        print("  (Use UI Sliders to adjust Body Height, Pitch, Roll, and Yaw)")
         print("====================================================\n")
 
         while True:
-            # Step the structural physics solver inside PyBullet environment
             pyb.stepSimulation(physicsClientId=self.client)
-
-            # Read keyboard inputs directly
             keys = pyb.getKeyboardEvents()
 
-            # Forward / Backward mapping
-            if 119 in keys:  # 'W'
-                self.commands[0] = max(self.commands[0] - 0.02, -0.30)
-            elif 115 in keys:  # 'S'
+            # Forward / Backward mapping (K/N)
+            if 107 in keys:  # 'K'
+                self.commands[0] = max(self.commands[0] - 0.02, -0.5)
+            elif 110 in keys:  # 'N'
                 self.commands[0] = min(self.commands[0] + 0.02, 0.40)
 
-            # Lateral Strafe mapping
-            if 97 in keys:  # 'A'
+            # Lateral Strafe mapping (B/M)
+            if 98 in keys:  # 'B'
                 self.commands[1] = min(self.commands[1] + 0.02, 0.25)
-            elif 100 in keys:  # 'D'
+            elif 109 in keys:  # 'M'
                 self.commands[1] = max(self.commands[1] - 0.02, -0.25)
 
-            # Yaw Rotational turn mapping
-            if 113 in keys:  # 'Q'
+            # Yaw Rotational turn mapping (J/L)
+            if 106 in keys:  # 'J'
                 self.commands[2] = min(self.commands[2] + 0.04, 0.50)
-            elif 101 in keys:  # 'E'
+            elif 108 in keys:  # 'L'
                 self.commands[2] = max(self.commands[2] - 0.04, -0.50)
 
             # Emergency Stop / Full Reset
             if 120 in keys:  # 'X'
                 self.commands = np.zeros(3, dtype=np.float32)
 
-            # Decelerate commands smoothly toward zero if no key is actively held down
+            # Decelerate commands smoothly toward zero
             if not keys:
                 self.commands[0] *= 0.95
                 self.commands[1] *= 0.95
                 self.commands[2] *= 0.90
 
-            # Execute the mathematical coordinate calculations
             self.update_gait()
 
-            # Dynamic Camera tracking preserves focus directly behind the robot chassis position
             base_pos, _ = pyb.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client)
             pyb.resetDebugVisualizerCamera(
                 cameraDistance=0.9, cameraYaw=50, cameraPitch=-25, cameraTargetPosition=base_pos,
                 physicsClientId=self.client
             )
 
-            # Precision frequency locking at a steady 60 Hz execution window
             time.sleep(1.0 / 60.0)
 
 
