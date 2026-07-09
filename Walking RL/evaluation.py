@@ -107,7 +107,7 @@ class QuadrupedPrecisionWalkingEnv(gym.Env):
             abs(roll) > 0.45 or
             abs(pitch) > 0.45 or
             abs(yaw) > 0.10 or  # Updated from 0.30 -> 0.20 rad
-            abs(base_pos[1]) > 0.20 or  # ENFORCED UPDATED 20CM CORRIDOR
+            abs(base_pos[1]) > 0.20 or  # ENFORCED UPDATED 7CM CORRIDOR
             global_forward_vel < -0.05
         )
         truncated = bool(self.step_count >= 6000)  # Extended to match 6k step training parameters
@@ -175,6 +175,20 @@ if __name__ == "__main__":
 
             done = terminated or truncated
 
+            # --- CAMERA TRACKING LOGIC ---
+            if env.render_mode == "human" and env.robot_id is not None:
+                # 1. Extract the current base position of the robot from PyBullet
+                base_pos, _ = pyb.getBasePositionAndOrientation(env.robot_id, physicsClientId=env.client)
+
+                # 2. Smoothly track the dog by setting the camera target to the robot's coordinates
+                pyb.resetDebugVisualizerCamera(
+                    cameraDistance=1.2,  # Distance from the dog
+                    cameraYaw=75,  # Angle looking from the side/front
+                    cameraPitch=-25,  # Look down angle
+                    cameraTargetPosition=base_pos,  # Focus directly on the dog
+                    physicsClientId=env.client
+                )
+
             # Print refreshing terminal diagnostic line
             print(
                 f"Progress [+X]: {info['dist_x']:.3f}m | "
@@ -182,7 +196,7 @@ if __name__ == "__main__":
                 f"Drift [Y]: {info['drift_y']:.3f}m | "
                 f"Vel [Y]: {info['vel_y']:.3f}m/s",
                 end="\r",
-                flush = True
+                flush=True
             )
 
             time.sleep(1.0 / 60.0)
