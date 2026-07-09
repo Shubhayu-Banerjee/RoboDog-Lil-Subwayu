@@ -181,7 +181,8 @@ if __name__ == "__main__":
                 f"Vel [X]: {info['vel_x']:.3f}m/s | "
                 f"Drift [Y]: {info['drift_y']:.3f}m | "
                 f"Vel [Y]: {info['vel_y']:.3f}m/s",
-                end="\r"
+                end="\r",
+                flush = True
             )
 
             time.sleep(1.0 / 60.0)
