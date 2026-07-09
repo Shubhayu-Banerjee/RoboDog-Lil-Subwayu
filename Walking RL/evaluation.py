@@ -107,7 +107,7 @@ class QuadrupedPrecisionWalkingEnv(gym.Env):
             abs(roll) > 0.45 or
             abs(pitch) > 0.45 or
             abs(yaw) > 0.10 or  # Updated from 0.30 -> 0.20 rad
-            abs(base_pos[1]) > 0.20 or  # ENFORCED UPDATED 7CM CORRIDOR
+            abs(base_pos[1]) > 0.20 or  # ENFORCED UPDATED 20CM CORRIDOR
             global_forward_vel < -0.05
         )
         truncated = bool(self.step_count >= 6000)  # Extended to match 6k step training parameters
