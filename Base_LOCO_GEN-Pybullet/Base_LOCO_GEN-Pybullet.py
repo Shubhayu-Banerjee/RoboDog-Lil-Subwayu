@@ -3,6 +3,180 @@ import math
 import numpy as np
 import pybullet as pyb
 import pybullet_data
+import multiprocessing as mp
+import threading
+from collections import deque
+
+
+# ==================== ACTUATOR TELEMETRY ====================
+ACTUATOR_MAX_TORQUE = 2.45       # N*m (25 kg*cm servo)
+ACTUATOR_MAX_CURRENT = 3.70      # A, maximum/stall current per servo
+SERVO_SUPPLY_VOLTAGE = 6.0       # V, used only for estimated electrical power
+
+
+# Telemetry architecture:
+#   PyBullet/main thread -> tiny raw-torque queue
+#   calculation thread   -> current/power calculation + smoothing
+#   matplotlib process    -> graph rendering
+TELEMETRY_CALC_QUEUE_SIZE = 4
+TELEMETRY_PLOT_QUEUE_SIZE = 2000
+TELEMETRY_PLOT_HZ = 20.0
+TELEMETRY_HISTORY_SECONDS = 30.0
+TELEMETRY_SMOOTH_ALPHA = 0.10
+
+
+# ==================== GAIT TRANSITION SETTINGS ====================
+
+# How quickly commanded velocity is allowed to change.
+# Smaller = faster response, larger = smoother.
+COMMAND_RAMP_TIME = 0.15       # seconds
+
+# How quickly the robot stops its gait after command reaches zero.
+STOP_RAMP_TIME = 0.20          # seconds
+
+# How quickly swing height comes on/off.
+STEP_HEIGHT_RISE_TIME = 0.12   # seconds
+STEP_HEIGHT_FALL_TIME = 0.16   # seconds
+
+# Full swing height.
+MAX_STEP_HEIGHT = 0.05         # meters
+
+# Minimum active command before considering the robot stopped.
+COMMAND_DEADZONE = 0.008
+
+# Phase considered "safe" for final standing reset.
+# We don't actually need to land exactly here because the gait amplitude
+# is already being collapsed toward zero, but this provides a clean reset.
+PHASE_RESET_WINDOW = 0.10      # radians
+
+TWO_PI = 2.0 * math.pi
+
+
+def actuator_calculation_worker(raw_queue, plot_queue, stop_event):
+    """Calculate total estimated current/power off the PyBullet thread."""
+    smooth_current = None
+
+    while not stop_event.is_set():
+        try:
+            timestamp, torques = raw_queue.get(timeout=0.2)
+        except Exception:
+            continue
+
+        torques = np.asarray(torques, dtype=np.float64)
+
+        # Torque -> proportional estimated current.
+        # This is an approximation, not a physical servo current model.
+        utilization = np.abs(torques) / ACTUATOR_MAX_TORQUE
+        estimated_currents = utilization * ACTUATOR_MAX_CURRENT
+        total_current = float(np.sum(estimated_currents))
+
+        # Smooth only the aggregate value so the graph remains readable.
+        if smooth_current is None:
+            smooth_current = total_current
+        else:
+            smooth_current += TELEMETRY_SMOOTH_ALPHA * (
+                total_current - smooth_current
+            )
+
+        # Plot total current directly. This is the requested quantity:
+        # instantaneous aggregate estimated servo current over time.
+        item = (float(timestamp), float(smooth_current), 0.0)
+
+        try:
+            plot_queue.put_nowait(item)
+        except Exception:
+            # Plot process is behind; discard this point rather than blocking
+            # the simulation/calculation pipeline.
+            pass
+
+
+def actuator_plot_worker(plot_queue, stop_event):
+    """Dedicated matplotlib process. It never touches PyBullet."""
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+
+    history = deque()
+    plot_period = 1.0 / TELEMETRY_PLOT_HZ
+
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(10, 5))
+    fig.canvas.manager.set_window_title("Robo Dog - Total Actuator Current")
+
+    line, = ax.plot([], [], linewidth=2)
+
+    ax.set_title("Robo Dog — Estimated Total Actuator Current")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Current (A)")
+    ax.grid(True, alpha=0.25)
+
+    # Keep the window responsive without requiring the simulation thread.
+    def update(_frame):
+        received = 0
+
+        while received < 500:
+            try:
+                item = plot_queue.get_nowait()
+            except Exception:
+                break
+
+            history.append(item)
+            received += 1
+
+        if not history:
+            return (line,)
+
+        # Keep a rolling time window.
+        newest_t = history[-1][0]
+        cutoff = newest_t - TELEMETRY_HISTORY_SECONDS
+
+        while history and history[0][0] < cutoff:
+            history.popleft()
+
+        times = np.fromiter((x[0] for x in history), dtype=float)
+        currents = np.fromiter((x[1] for x in history), dtype=float)
+
+        # Plot relative simulation time so the x-axis stays readable.
+        times = times - times[0]
+
+        line.set_data(times, currents)
+
+        ax.set_xlim(
+            max(0.0, times[-1] - TELEMETRY_HISTORY_SECONDS),
+            max(TELEMETRY_HISTORY_SECONDS, times[-1] + 0.1)
+        )
+
+        ymax = max(float(np.max(currents)) * 1.15, 1.0)
+        ax.set_ylim(0.0, ymax)
+
+        latest_current = history[-1][1]
+
+        ax.set_title(
+            "Robo Dog — Estimated Total Actuator Current\n"
+            f"{latest_current:.2f} A total"
+        )
+
+        fig.canvas.draw_idle()
+        return (line,)
+
+    def on_close(_event):
+        stop_event.set()
+
+    fig.canvas.mpl_connect("close_event", on_close)
+
+    animation = FuncAnimation(
+        fig,
+        update,
+        interval=1000.0 / TELEMETRY_PLOT_HZ,
+        blit=False,
+        cache_frame_data=False
+    )
+
+    while not stop_event.is_set():
+        plt.pause(plot_period)
+
+    plt.close(fig)
 
 
 class PureMathQuadruped:
@@ -31,45 +205,114 @@ class PureMathQuadruped:
         self.hip_offset_y = 0.055
 
         # Interactive UI Sliders for Body Pose & Height
-        self.height_slider = pyb.addUserDebugParameter("Body Height", -0.25, -0.05, -0.17)
-        self.roll_slider = pyb.addUserDebugParameter("Body Roll", -0.4, 0.4, 0.0)
-        self.pitch_slider = pyb.addUserDebugParameter("Body Pitch", -0.4, 0.4, 0.0)
-        self.yaw_slider = pyb.addUserDebugParameter("Static Body Yaw", -0.5, 0.5, 0.0)
+        self.height_slider = pyb.addUserDebugParameter(
+            "Body Height", -0.25, -0.05, -0.17
+        )
 
+        self.roll_slider = pyb.addUserDebugParameter(
+            "Body Roll", -0.4, 0.4, 0.0
+        )
+
+        self.pitch_slider = pyb.addUserDebugParameter(
+            "Body Pitch", -0.4, 0.4, 0.0
+        )
+
+        self.yaw_slider = pyb.addUserDebugParameter(
+            "Static Body Yaw", -0.5, 0.5, 0.0
+        )
+
+        # ==================== CPG ====================
         self.cpg_time = 0.0
         self.gait_frequency = 2.0
 
-        # Interactive Vector Commands: [Forward/Backward, Left/Right Strafe, Dynamic Yaw]
+        # ==================== CPG ====================
+        self.cpg_time = 0.0
+        self.gait_frequency = 2.0
+
+        # Actual filtered command used by the gait.
+        # self.commands remains the user's requested command.
+        self.active_command = np.zeros(3, dtype=np.float32)
+
+        # Current smooth swing height.
+        self.current_step_height = 0.0
+
+        # Gait state:
+        # RUNNING  = normal CPG walking
+        # STOPPING = smoothly collapsing gait to standing
+        # STANDING = fully stopped / neutral
+        self.gait_state = "STANDING"
+
+        # Used to track stopping progression.
+        self.stop_timer = 0.0
+
+        # Interactive Vector Commands:
+        # [Forward/Backward, Left/Right Strafe, Dynamic Yaw]
         self.commands = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
         # --- JUMP STATE MACHINE VARIABLES ---
-        self.jump_state = "GROUNDED"  # States: GROUNDED, WIND_DOWN, STABILIZE, LAUNCH, FLIGHT
+        self.jump_state = "GROUNDED"
         self.jump_timer = 0.0
         self.jump_pitch = 0.0
-        self.jump_z_front = 0.0  # Front legs extension target (Legs 2 & 3)
-        self.jump_z_rear = 0.0  # Rear legs extension target (Legs 0 & 1)
-        self.motor_force = 5.88  # Strictly locked to original physics limit
+        self.jump_z_front = 0.0
+        self.jump_z_rear = 0.0
+        self.motor_force = ACTUATOR_MAX_TORQUE
 
         self._setup_world()
+
+        # ==================== NON-BLOCKING TELEMETRY ====================
+        self.telemetry_raw_queue = mp.Queue(
+            maxsize=TELEMETRY_CALC_QUEUE_SIZE
+        )
+
+        self.telemetry_plot_queue = mp.Queue(
+            maxsize=TELEMETRY_PLOT_QUEUE_SIZE
+        )
+
+        self.telemetry_stop_event = mp.Event()
+
+        self.telemetry_calc_thread = threading.Thread(
+            target=actuator_calculation_worker,
+            args=(
+                self.telemetry_raw_queue,
+                self.telemetry_plot_queue,
+                self.telemetry_stop_event
+            ),
+            daemon=True,
+            name="ActuatorCalculation"
+        )
+
+        self.telemetry_plot_process = None
+        self.telemetry_start_time = time.perf_counter()
+
+        self.telemetry_calc_thread.start()
 
     def _create_wedge_mesh(self, length, width, height):
         """Generates raw triangular mesh vertices with a tiny lip to eliminate Z-fighting"""
         lip = 0.002
+
         vertices = [
-            [0, -width / 2, lip],  # 0: Front Left
-            [0, width / 2, lip],  # 1: Front Right
-            [length, -width / 2, lip],  # 2: Back Left Base
-            [length, width / 2, lip],  # 3: Back Right Base
-            [length, -width / 2, height],  # 4: Back Left Peak
-            [length, width / 2, height]  # 5: Back Right Peak
+            [0, -width / 2, lip],
+            [0, width / 2, lip],
+            [length, -width / 2, lip],
+            [length, width / 2, lip],
+            [length, -width / 2, height],
+            [length, width / 2, height]
         ]
+
         indices = [
-            0, 2, 1, 1, 2, 3,  # Bottom face
-            0, 1, 4, 1, 5, 4,  # Sloped ramp face
-            0, 4, 2,  # Left triangle side
-            1, 3, 5,  # Right triangle side
-            2, 4, 3, 3, 4, 5  # Back vertical wall
+            0, 2, 1,
+            1, 2, 3,
+
+            0, 1, 4,
+            1, 5, 4,
+
+            0, 4, 2,
+            1, 3, 5,
+
+            2, 4, 3,
+            3, 4, 5
         ]
+
         return vertices, indices
 
     def _setup_world(self):
@@ -77,7 +320,10 @@ class PureMathQuadruped:
         pyb.setGravity(0, 0, -9.81, physicsClientId=self.client)
         pyb.setTimeStep(1.0 / 240.0, physicsClientId=self.client)
 
-        self.plane_id = pyb.loadURDF("plane.urdf", physicsClientId=self.client)
+        self.plane_id = pyb.loadURDF(
+            "plane.urdf",
+            physicsClientId=self.client
+        )
 
         # Progressive ramp network layout
         ramps_config = [
@@ -90,54 +336,136 @@ class PureMathQuadruped:
 
         for config in ramps_config:
             l, w, h = config["size"]
-            verts, idxs = self._create_wedge_mesh(l, w, h)
 
-            collision_id = pyb.createCollisionShape(pyb.GEOM_MESH, vertices=verts, indices=idxs,
-                                                    physicsClientId=self.client)
-            visual_id = pyb.createVisualShape(pyb.GEOM_MESH, vertices=verts, indices=idxs,
-                                              rgbaColor=[0.4, 0.4, 0.45, 1.0], physicsClientId=self.client)
-            ramp_id = pyb.createMultiBody(baseMass=0, baseCollisionShapeIndex=collision_id,
-                                          baseVisualShapeIndex=visual_id, basePosition=config["pos"],
-                                          physicsClientId=self.client)
-            pyb.changeDynamics(ramp_id, -1, lateralFriction=2.5, physicsClientId=self.client)
+            verts, idxs = self._create_wedge_mesh(
+                l,
+                w,
+                h
+            )
+
+            collision_id = pyb.createCollisionShape(
+                pyb.GEOM_MESH,
+                vertices=verts,
+                indices=idxs,
+                physicsClientId=self.client
+            )
+
+            visual_id = pyb.createVisualShape(
+                pyb.GEOM_MESH,
+                vertices=verts,
+                indices=idxs,
+                rgbaColor=[0.4, 0.4, 0.45, 1.0],
+                physicsClientId=self.client
+            )
+
+            ramp_id = pyb.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=collision_id,
+                baseVisualShapeIndex=visual_id,
+                basePosition=config["pos"],
+                physicsClientId=self.client
+            )
+
+            pyb.changeDynamics(
+                ramp_id,
+                -1,
+                lateralFriction=2.5,
+                physicsClientId=self.client
+            )
 
         # Spawn robot
         start_pos = [0, 0, 0.19]
         start_ori = pyb.getQuaternionFromEuler([0, 0, 0])
-        self.robot_id = pyb.loadURDF("robot.urdf", start_pos, start_ori, useFixedBase=False,
-                                     physicsClientId=self.client)
+
+        self.robot_id = pyb.loadURDF(
+            "robot.urdf",
+            start_pos,
+            start_ori,
+            useFixedBase=False,
+        )
 
         for joint in range(12):
-            pyb.changeDynamics(self.robot_id, joint, lateralFriction=1.8, physicsClientId=self.client)
-        pyb.changeDynamics(self.plane_id, -1, lateralFriction=1.8, physicsClientId=self.client)
+            pyb.changeDynamics(
+                self.robot_id,
+                joint,
+                lateralFriction=1.8,
+                physicsClientId=self.client
+            )
+
+        pyb.changeDynamics(
+            self.plane_id,
+            -1,
+            lateralFriction=1.8,
+            physicsClientId=self.client
+        )
 
     def analytical_ik(self, leg_index, target_xyz):
         x, y, z = target_xyz
+
         is_left_side = 1.0 if leg_index in [0, 2] else -1.0
+
         y_hip = y - (is_left_side * self.hip_offset_y)
 
         d = math.sqrt(y_hip ** 2 + z ** 2)
-        if d == 0: return 0.0, 0.0, 0.0
+
+        if d == 0:
+            return 0.0, 0.0, 0.0
+
         hip_roll = math.atan2(y_hip, -z)
 
         z_proj = -math.sqrt(d ** 2)
+
         r_sq = x ** 2 + z_proj ** 2
         r = math.sqrt(r_sq)
 
-        cos_calf = (self.l1 ** 2 + self.l2 ** 2 - r_sq) / (2.0 * self.l1 * self.l2)
-        cos_calf = np.clip(cos_calf, -1.0, 1.0)
+        cos_calf = (
+            self.l1 ** 2 +
+            self.l2 ** 2 -
+            r_sq
+        ) / (
+            2.0 *
+            self.l1 *
+            self.l2
+        )
+
+        cos_calf = np.clip(
+            cos_calf,
+            -1.0,
+            1.0
+        )
+
         calf_knee = math.pi - math.acos(cos_calf)
 
-        alpha = math.atan2(x, -z_proj)
-        cos_beta = (self.l1 ** 2 + r_sq - self.l2 ** 2) / (2.0 * self.l1 * r)
-        cos_beta = np.clip(cos_beta, -1.0, 1.0)
+        alpha = math.atan2(
+            x,
+            -z_proj
+        )
+
+        cos_beta = (
+            self.l1 ** 2 +
+            r_sq -
+            self.l2 ** 2
+        ) / (
+            2.0 *
+            self.l1 *
+            r
+        )
+
+        cos_beta = np.clip(
+            cos_beta,
+            -1.0,
+            1.0
+        )
+
         beta = math.acos(cos_beta)
+
         thigh_pitch = alpha - beta
 
         return hip_roll, thigh_pitch, calf_knee
 
     def _process_jump_state(self):
         """Manages jumping dynamics with flat pitch profiles and inverted axis stroke mapping"""
+
         dt = 1.0 / 60.0
 
         if self.jump_state == "GROUNDED":
@@ -147,9 +475,14 @@ class PureMathQuadruped:
 
         elif self.jump_state == "WIND_DOWN":
             self.jump_timer += dt
-            t_ratio = min(self.jump_timer / 0.20, 1.0)
-            # Symmetrical flat vertical compression
+
+            t_ratio = min(
+                self.jump_timer / 0.20,
+                1.0
+            )
+
             crouch = 0.07 * t_ratio
+
             self.jump_z_front = crouch
             self.jump_z_rear = crouch
             self.jump_pitch = 0.0
@@ -160,7 +493,7 @@ class PureMathQuadruped:
 
         elif self.jump_state == "STABILIZE":
             self.jump_timer += dt
-            # Hold steady for 500ms to eliminate crouch inertia
+
             self.jump_z_front = 0.07
             self.jump_z_rear = 0.07
             self.jump_pitch = 0.0
@@ -171,9 +504,7 @@ class PureMathQuadruped:
 
         elif self.jump_state == "LAUNCH":
             self.jump_timer += dt
-            # --- ASYMMETRICAL EXTENSION CORRECTED FOR -X AXIS ---
-            # Legs 0 & 1 are at the structural REAR (-X) -> get massive -0.09m push to punch COG up.
-            # Legs 2 & 3 are at the structural FRONT (+X) -> get small -0.02m push to stop nose wheelies.
+
             self.jump_z_rear = -0.09
             self.jump_z_front = -0.02
             self.jump_pitch = 0.0
@@ -184,7 +515,7 @@ class PureMathQuadruped:
 
         elif self.jump_state == "FLIGHT":
             self.jump_timer += dt
-            # Uniform high-clearance tuck in mid-air
+
             self.jump_z_front = 0.02
             self.jump_z_rear = 0.02
             self.jump_pitch = 0.0
@@ -193,131 +524,772 @@ class PureMathQuadruped:
                 self.jump_state = "GROUNDED"
                 self.jump_timer = 0.0
 
+    # ============================================================
+    # GAIT TRANSITION HELPERS
+    # ============================================================
+
+    @staticmethod
+    def _smoothstep(x):
+        """
+        Cubic smoothstep.
+
+        0 -> 0
+        1 -> 1
+
+        Zero slope at both ends, avoiding sudden acceleration.
+        """
+        x = max(0.0, min(1.0, x))
+        return x * x * (3.0 - 2.0 * x)
+
+    def _ramp_vector(self, current, target, dt, ramp_time):
+        """
+        Smoothly move current command toward target.
+
+        This is deliberately independent of the CPG itself.
+        """
+        if ramp_time <= 0.0:
+            return target.copy()
+
+        alpha = min(
+            dt / ramp_time,
+            1.0
+        )
+
+        # Smooth exponential-ish response.
+        # This avoids a hard discontinuity.
+        return current + (target - current) * alpha
+
+    def _update_command_ramp(self, dt):
+        """
+        Move the actual gait command toward the requested command.
+
+        self.commands = what the user asks for.
+        self.active_command = what the CPG actually receives.
+        """
+
+        target = self.commands.copy()
+
+        # During jumping, don't allow locomotion commands to leak
+        # into the jump controller.
+        if self.jump_state != "GROUNDED":
+            target[:] = 0.0
+
+        self.active_command = self._ramp_vector(
+            self.active_command,
+            target,
+            dt,
+            COMMAND_RAMP_TIME
+        )
+
+        # Kill tiny numerical residuals.
+        for i in range(3):
+            if abs(self.active_command[i]) < COMMAND_DEADZONE:
+                self.active_command[i] = 0.0
+
+    def _update_step_height(self, dt):
+        """
+        Smoothly ramp swing height.
+
+        This prevents:
+            0 mm -> 50 mm
+
+        from happening in a single frame.
+        """
+
+        command_magnitude = max(
+            abs(float(self.active_command[0])),
+            abs(float(self.active_command[1])),
+            abs(float(self.active_command[2]))
+        )
+
+        if (
+            command_magnitude > COMMAND_DEADZONE
+            and self.jump_state == "GROUNDED"
+        ):
+            target_height = MAX_STEP_HEIGHT
+        else:
+            target_height = 0.0
+
+        if target_height > self.current_step_height:
+            ramp_time = STEP_HEIGHT_RISE_TIME
+        else:
+            ramp_time = STEP_HEIGHT_FALL_TIME
+
+        if ramp_time <= 0.0:
+            self.current_step_height = target_height
+            return
+
+        alpha = min(
+            dt / ramp_time,
+            1.0
+        )
+
+        self.current_step_height += (
+            target_height - self.current_step_height
+        ) * alpha
+
+        if abs(self.current_step_height) < 0.0001:
+            self.current_step_height = 0.0
+
+    def _handle_gait_state(self, dt):
+        """
+        Handles RUNNING -> STOPPING -> STANDING.
+
+        Important behavior:
+
+        1. User releases movement.
+        2. active_command smoothly approaches zero.
+        3. CPG continues running during the transition.
+        4. As the stride amplitude collapses, the feet naturally converge
+           toward their neutral positions.
+        5. Once almost stationary, the oscillator phase is reset cleanly.
+        """
+
+        active_mag = max(
+            abs(float(self.active_command[0])),
+            abs(float(self.active_command[1])),
+            abs(float(self.active_command[2]))
+        )
+
+        requested_mag = max(
+            abs(float(self.commands[0])),
+            abs(float(self.commands[1])),
+            abs(float(self.commands[2]))
+        )
+
+        # ------------------------------------------------------------
+        # START WALKING
+        # ------------------------------------------------------------
+        if requested_mag > COMMAND_DEADZONE:
+
+            self.gait_state = "RUNNING"
+            self.stop_timer = 0.0
+
+            return
+
+        # ------------------------------------------------------------
+        # ALREADY STANDING
+        # ------------------------------------------------------------
+        if (
+            self.gait_state == "STANDING"
+            and active_mag <= COMMAND_DEADZONE
+        ):
+            return
+
+        # ------------------------------------------------------------
+        # START STOPPING
+        # ------------------------------------------------------------
+        if self.gait_state == "RUNNING":
+            self.gait_state = "STOPPING"
+            self.stop_timer = 0.0
+
+        # ------------------------------------------------------------
+        # STOPPING
+        # ------------------------------------------------------------
+        if self.gait_state == "STOPPING":
+
+            self.stop_timer += dt
+
+            # Once command is basically zero and enough time has passed,
+            # wait for the gait amplitude to become negligible.
+            if (
+                active_mag <= COMMAND_DEADZONE
+                and
+                self.stop_timer >= STOP_RAMP_TIME
+            ):
+                # We are now effectively standing.
+                #
+                # Reset phase to a known point instead of leaving the CPG
+                # frozen at an arbitrary point in its cycle.
+                self.cpg_time = 0.0
+
+                self.active_command[:] = 0.0
+                self.current_step_height = 0.0
+
+                self.gait_state = "STANDING"
+                self.stop_timer = 0.0
+
     def update_gait(self):
-        self.cpg_time += 1.0 / 60.0
-        omega = 2.0 * math.pi * self.gait_frequency
+        dt = 1.0 / 60.0
+
+        # ============================================================
+        # PHASE UPDATE
+        # ============================================================
+
+        # Convert the CPG to an explicitly bounded phase.
+        #
+        # Instead of allowing cpg_time to grow forever, keep it in
+        # seconds but periodically wrap it.
+        self.cpg_time += dt
+
+        gait_period = 1.0 / self.gait_frequency
+
+        if self.cpg_time >= gait_period:
+            self.cpg_time -= gait_period
+
+        phase = TWO_PI * self.gait_frequency * self.cpg_time
+
+        # ============================================================
+        # JUMP
+        # ============================================================
 
         self._process_jump_state()
 
-        body_h = pyb.readUserDebugParameter(self.height_slider)
-        b_roll = pyb.readUserDebugParameter(self.roll_slider)
-        b_pitch = pyb.readUserDebugParameter(self.pitch_slider) + self.jump_pitch
-        b_yaw = pyb.readUserDebugParameter(self.yaw_slider)
+        # ============================================================
+        # COMMAND RAMP
+        # ============================================================
+
+        self._update_command_ramp(dt)
+
+        # ============================================================
+        # GAIT STATE MACHINE
+        # ============================================================
+
+        self._handle_gait_state(dt)
+
+        # ============================================================
+        # STEP HEIGHT RAMP
+        # ============================================================
+
+        self._update_step_height(dt)
+
+        # ============================================================
+        # BODY POSE
+        # ============================================================
+
+        body_h = pyb.readUserDebugParameter(
+            self.height_slider
+        )
+
+        b_roll = pyb.readUserDebugParameter(
+            self.roll_slider
+        )
+
+        b_pitch = (
+            pyb.readUserDebugParameter(self.pitch_slider)
+            + self.jump_pitch
+        )
+
+        b_yaw = pyb.readUserDebugParameter(
+            self.yaw_slider
+        )
+
+        # ============================================================
+        # ACTIVE COMMAND
+        # ============================================================
 
         if self.jump_state == "GROUNDED":
-            v_x, v_y, w_yaw = self.commands[0], self.commands[1], self.commands[2]
+            v_x = float(self.active_command[0])
+            v_y = float(self.active_command[1])
+            w_yaw = float(self.active_command[2])
         else:
-            v_x, v_y, w_yaw = 0.0, 0.0, 0.0
+            v_x = 0.0
+            v_y = 0.0
+            w_yaw = 0.0
+
+        # ============================================================
+        # STRIDE
+        # ============================================================
 
         stride_x = v_x * 0.12
         stride_y = v_y * 0.10
-        step_height = 0.05 if (abs(v_x) > 0.01 or abs(v_y) > 0.01 or abs(w_yaw) > 0.01) else 0.0
 
-        phases = [omega * self.cpg_time, omega * self.cpg_time + math.pi,
-                  omega * self.cpg_time + math.pi, omega * self.cpg_time]
+        # IMPORTANT:
+        #
+        # Step height is now smoothly ramped rather than:
+        #
+        #     moving = TRUE  ->  0.05
+        #     moving = FALSE ->  0.00
+        #
+        step_height = self.current_step_height
 
-        base_x = [0.12, 0.12, -0.12, -0.12]
-        base_y = [self.hip_offset_y, -self.hip_offset_y, self.hip_offset_y, -self.hip_offset_y]
+        # ============================================================
+        # DIAGONAL CPG
+        # ============================================================
+
+        phases = [
+            phase,
+            phase + math.pi,
+            phase + math.pi,
+            phase
+        ]
+
+        base_x = [
+            0.12,
+            0.12,
+            -0.12,
+            -0.12
+        ]
+
+        base_y = [
+            self.hip_offset_y,
+            -self.hip_offset_y,
+            self.hip_offset_y,
+            -self.hip_offset_y
+        ]
+
+        # ============================================================
+        # LEG GENERATION
+        # ============================================================
 
         for i in range(4):
+
             p = phases[i]
-            x_step = stride_x * math.cos(p)
-            y_step = stride_y * math.cos(p)
-            z_step = step_height * max(0.0, math.sin(p))
+
+            # --------------------------------------------------------
+            # HORIZONTAL CPG MOTION
+            # --------------------------------------------------------
+
+            cos_p = math.cos(p)
+            sin_p = math.sin(p)
+
+            x_step = stride_x * cos_p
+            y_step = stride_y * cos_p
+
+            # --------------------------------------------------------
+            # SWING TRAJECTORY
+            # --------------------------------------------------------
+            #
+            # Still using your original positive-half sine trajectory.
+            # Phase 1-3 intentionally does NOT replace the CPG here.
+            #
+            # The difference is that step_height itself is now smooth.
+            #
+
+            z_step = step_height * max(
+                0.0,
+                sin_p
+            )
+
+            # --------------------------------------------------------
+            # DYNAMIC YAW
+            # --------------------------------------------------------
 
             dynamic_yaw_rx = base_y[i]
             dynamic_yaw_ry = -base_x[i]
-            x_step += w_yaw * dynamic_yaw_rx * 0.4 * math.cos(p)
-            y_step += w_yaw * dynamic_yaw_ry * 0.4 * math.cos(p)
 
-            pitch_z_extension = base_x[i] * math.tan(b_pitch)
-            roll_z_extension = -base_y[i] * math.tan(b_roll)
+            x_step += (
+                w_yaw *
+                dynamic_yaw_rx *
+                0.4 *
+                cos_p
+            )
 
-            static_yaw_x = -(base_x[i] * (math.cos(b_yaw) - 1.0) - base_y[i] * math.sin(b_yaw))
-            static_yaw_y = -(base_x[i] * math.sin(b_yaw) + base_y[i] * (math.cos(b_yaw) - 1.0))
+            y_step += (
+                w_yaw *
+                dynamic_yaw_ry *
+                0.4 *
+                cos_p
+            )
+
+            # --------------------------------------------------------
+            # BODY PITCH / ROLL
+            # --------------------------------------------------------
+
+            pitch_z_extension = (
+                base_x[i] *
+                math.tan(b_pitch)
+            )
+
+            roll_z_extension = (
+                -base_y[i] *
+                math.tan(b_roll)
+            )
+
+            # --------------------------------------------------------
+            # STATIC BODY YAW
+            # --------------------------------------------------------
+
+            cos_yaw = math.cos(b_yaw)
+            sin_yaw = math.sin(b_yaw)
+
+            static_yaw_x = -(
+                base_x[i] *
+                (cos_yaw - 1.0)
+                -
+                base_y[i] *
+                sin_yaw
+            )
+
+            static_yaw_y = -(
+                base_x[i] *
+                sin_yaw
+                +
+                base_y[i] *
+                (cos_yaw - 1.0)
+            )
+
+            # --------------------------------------------------------
+            # FINAL XY TARGET
+            # --------------------------------------------------------
 
             ik_x = x_step + static_yaw_x
             ik_y = y_step + static_yaw_y
 
-            # --- MAP THE GEOMETRIC COMPENSATIONS BASED ON REVERSE FRAME ---
+            # --------------------------------------------------------
+            # FINAL Z TARGET
+            # --------------------------------------------------------
+
             if self.jump_state != "GROUNDED":
-                # Legs 0 & 1 are REAR (-X) -> receive jump_z_rear
-                # Legs 2 & 3 are FRONT (+X) -> receive jump_z_front
-                current_jump_z = self.jump_z_rear if i in [0, 1] else self.jump_z_front
-                ik_z = z_step + pitch_z_extension + roll_z_extension + (-0.17 + current_jump_z)
+
+                # Legs 0 & 1 are REAR (-X)
+                # Legs 2 & 3 are FRONT (+X)
+
+                current_jump_z = (
+                    self.jump_z_rear
+                    if i in [0, 1]
+                    else self.jump_z_front
+                )
+
+                ik_z = (
+                    z_step
+                    +
+                    pitch_z_extension
+                    +
+                    roll_z_extension
+                    +
+                    (-0.17 + current_jump_z)
+                )
+
             else:
-                ik_z = body_h + z_step + pitch_z_extension + roll_z_extension
 
-            hip, thigh, calf = self.analytical_ik(i, (ik_x, ik_y, ik_z))
+                ik_z = (
+                    body_h
+                    +
+                    z_step
+                    +
+                    pitch_z_extension
+                    +
+                    roll_z_extension
+                )
 
-            pyb.setJointMotorControl2(self.robot_id, i * 3, pyb.POSITION_CONTROL, targetPosition=hip,
-                                      force=self.motor_force)
-            pyb.setJointMotorControl2(self.robot_id, i * 3 + 1, pyb.POSITION_CONTROL, targetPosition=thigh,
-                                      force=self.motor_force)
-            pyb.setJointMotorControl2(self.robot_id, i * 3 + 2, pyb.POSITION_CONTROL, targetPosition=calf,
-                                      force=self.motor_force)
+            # --------------------------------------------------------
+            # ANALYTICAL IK
+            # --------------------------------------------------------
+
+            hip, thigh, calf = self.analytical_ik(
+                i,
+                (ik_x, ik_y, ik_z)
+            )
+
+            # --------------------------------------------------------
+            # SERVO TARGETS
+            # --------------------------------------------------------
+
+            pyb.setJointMotorControl2(
+                self.robot_id,
+                i * 3,
+                pyb.POSITION_CONTROL,
+                targetPosition=hip,
+                force=self.motor_force
+            )
+
+            pyb.setJointMotorControl2(
+                self.robot_id,
+                i * 3 + 1,
+                pyb.POSITION_CONTROL,
+                targetPosition=thigh,
+                force=self.motor_force
+            )
+
+            pyb.setJointMotorControl2(
+                self.robot_id,
+                i * 3 + 2,
+                pyb.POSITION_CONTROL,
+                targetPosition=calf,
+                force=self.motor_force
+            )
+
+    def update_actuator_telemetry(self):
+        """Fast telemetry producer: read torques and hand them off."""
+
+        timestamp = (
+            time.perf_counter()
+            -
+            self.telemetry_start_time
+        )
+
+        torques = []
+
+        for joint_index in range(12):
+
+            joint_state = pyb.getJointState(
+                self.robot_id,
+                joint_index,
+                physicsClientId=self.client
+            )
+
+            torques.append(
+                float(joint_state[3])
+            )
+
+        try:
+
+            self.telemetry_raw_queue.put_nowait(
+                (
+                    timestamp,
+                    torques
+                )
+            )
+
+        except Exception:
+
+            # Never let telemetry block the physics loop.
+            pass
 
     def run_loop(self):
-        print("\n=== PURE MATHEMATICAL JOYSTICK CONTROLLER ACTIVE ===")
+
+        print(
+            "\n=== PURE MATHEMATICAL JOYSTICK CONTROLLER ACTIVE ==="
+        )
+
         print("Locomotion Controls:")
-        print("  [K] -> Forward (-X)   [N] -> Backward (+X)")
-        print("  [B] -> Strafe Left    [M] -> Strafe Right")
-        print("  [J] -> Rotate CCW     [L] -> Rotate CW")
+        print("  [K] -> Forward (-X)")
+        print("  [N] -> Backward (+X)")
+        print("  [B] -> Strafe Left")
+        print("  [M] -> Strafe Right")
+        print("  [J] -> Rotate CCW")
+        print("  [L] -> Rotate CW")
+        print("  [X] -> Stop")
         print("  [SPACEBAR] -> Level Stance Stabilized Jump Sequence")
+
+        print("\nGait:")
+        print(f"  CPG frequency       : {self.gait_frequency:.2f} Hz")
+        print(f"  Command ramp        : {COMMAND_RAMP_TIME:.2f} s")
+        print(f"  Stop ramp           : {STOP_RAMP_TIME:.2f} s")
+        print(f"  Max step height     : {MAX_STEP_HEIGHT * 1000:.0f} mm")
+        print(f"  Step height rise    : {STEP_HEIGHT_RISE_TIME:.2f} s")
+        print(f"  Step height fall    : {STEP_HEIGHT_FALL_TIME:.2f} s")
+
         print("\nCamera View Adjustments:")
         print("  [UP ARROW] / [DOWN ARROW]   -> Adjust Camera Pitch")
         print("  [LEFT ARROW] / [RIGHT ARROW] -> Adjust Camera Yaw")
+
+        print("====================================================")
+
+        print("\nTelemetry:")
+        print("  Separate calculation thread + separate matplotlib process")
+        print(f"  Servo torque limit: {ACTUATOR_MAX_TORQUE:.2f} N*m")
+        print(f"  Servo current limit: {ACTUATOR_MAX_CURRENT:.2f} A")
+        print("  Telemetry quantity: total estimated actuator current")
         print("====================================================\n")
 
-        while True:
-            pyb.stepSimulation(physicsClientId=self.client)
-            keys = pyb.getKeyboardEvents()
+        # Start plotting in a completely separate process.
+        self.telemetry_plot_process = mp.Process(
+            target=actuator_plot_worker,
+            args=(
+                self.telemetry_plot_queue,
+                self.telemetry_stop_event
+            ),
+            daemon=True,
+            name="ActuatorPowerPlot"
+        )
 
-            # Spacebar jump activation
-            if 32 in keys and self.jump_state == "GROUNDED":
-                self.jump_state = "WIND_DOWN"
-                self.jump_timer = 0.0
+        self.telemetry_plot_process.start()
 
-            # Locomotion Key Processing
-            if 107 in keys:
-                self.commands[0] = max(self.commands[0] - 0.02, -0.5)  # K
-            elif 110 in keys:
-                self.commands[0] = min(self.commands[0] + 0.02, 0.40)  # N
+        try:
 
-            if 98 in keys:
-                self.commands[1] = min(self.commands[1] + 0.02, 0.25)  # B
-            elif 109 in keys:
-                self.commands[1] = max(self.commands[1] - 0.02, -0.25)  # M
+            while True:
 
-            if 106 in keys:
-                self.commands[2] = min(self.commands[2] + 0.04, 0.50)  # J
-            elif 108 in keys:
-                self.commands[2] = max(self.commands[2] - 0.04, -0.50)  # L
+                # ----------------------------------------------------
+                # PHYSICS
+                # ----------------------------------------------------
 
-            if 120 in keys: self.commands = np.zeros(3, dtype=np.float32)  # X
+                pyb.stepSimulation(
+                    physicsClientId=self.client
+                )
 
-            if not keys:
-                self.commands[0] *= 0.95
-                self.commands[1] *= 0.95
-                self.commands[2] *= 0.90
+                # ----------------------------------------------------
+                # KEYBOARD
+                # ----------------------------------------------------
 
-            # Dynamic Arrow Camera processing
-            if pyb.B3G_LEFT_ARROW in keys: self.cam_yaw -= 1.5
-            if pyb.B3G_RIGHT_ARROW in keys: self.cam_yaw += 1.5
-            if pyb.B3G_UP_ARROW in keys: self.cam_pitch = min(self.cam_pitch + 1.0, -5.0)
-            if pyb.B3G_DOWN_ARROW in keys: self.cam_pitch = max(self.cam_pitch - 1.0, -75.0)
+                keys = pyb.getKeyboardEvents()
 
-            self.update_gait()
+                # ----------------------------------------------------
+                # SPACEBAR JUMP
+                # ----------------------------------------------------
 
-            base_pos, _ = pyb.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client)
-            pyb.resetDebugVisualizerCamera(
-                cameraDistance=self.cam_distance, cameraYaw=self.cam_yaw, cameraPitch=self.cam_pitch,
-                cameraTargetPosition=base_pos, physicsClientId=self.client
-            )
+                if (
+                    32 in keys
+                    and
+                    self.jump_state == "GROUNDED"
+                ):
+                    self.jump_state = "WIND_DOWN"
+                    self.jump_timer = 0.0
 
-            time.sleep(1.0 / 60.0)
+                # ----------------------------------------------------
+                # FORWARD / BACKWARD
+                # ----------------------------------------------------
+
+                if 107 in keys:
+                    self.commands[0] = max(
+                        self.commands[0] - 0.02,
+                        -0.5
+                    )
+
+                elif 110 in keys:
+                    self.commands[0] = min(
+                        self.commands[0] + 0.02,
+                        0.40
+                    )
+
+                # ----------------------------------------------------
+                # STRAFE
+                # ----------------------------------------------------
+
+                if 98 in keys:
+                    self.commands[1] = min(
+                        self.commands[1] + 0.02,
+                        0.25
+                    )
+
+                elif 109 in keys:
+                    self.commands[1] = max(
+                        self.commands[1] - 0.02,
+                        -0.25
+                    )
+
+                # ----------------------------------------------------
+                # YAW
+                # ----------------------------------------------------
+
+                if 106 in keys:
+                    self.commands[2] = min(
+                        self.commands[2] + 0.04,
+                        0.50
+                    )
+
+                elif 108 in keys:
+                    self.commands[2] = max(
+                        self.commands[2] - 0.04,
+                        -0.50
+                    )
+
+                # ----------------------------------------------------
+                # HARD STOP REQUEST
+                # ----------------------------------------------------
+                #
+                # This no longer directly freezes the CPG.
+                #
+                # It only sets the requested command to zero.
+                # The gait controller then performs its smooth
+                # RUNNING -> STOPPING -> STANDING transition.
+                #
+
+                if 120 in keys:
+                    self.commands[:] = 0.0
+
+                # ----------------------------------------------------
+                # NATURAL COMMAND DECAY
+                # ----------------------------------------------------
+                #
+                # Keep the original behavior, but the gait itself
+                # still has an additional smooth ramp.
+                #
+
+                if not keys:
+                    self.commands[0] *= 0.95
+                    self.commands[1] *= 0.95
+                    self.commands[2] *= 0.90
+
+                # ----------------------------------------------------
+                # CAMERA
+                # ----------------------------------------------------
+
+                if pyb.B3G_LEFT_ARROW in keys:
+                    self.cam_yaw -= 1.5
+
+                if pyb.B3G_RIGHT_ARROW in keys:
+                    self.cam_yaw += 1.5
+
+                if pyb.B3G_UP_ARROW in keys:
+                    self.cam_pitch = min(
+                        self.cam_pitch + 1.0,
+                        -5.0
+                    )
+
+                if pyb.B3G_DOWN_ARROW in keys:
+                    self.cam_pitch = max(
+                        self.cam_pitch - 1.0,
+                        -75.0
+                    )
+
+                # ----------------------------------------------------
+                # GAIT
+                # ----------------------------------------------------
+
+                self.update_gait()
+
+                # ----------------------------------------------------
+                # TELEMETRY
+                # ----------------------------------------------------
+
+                self.update_actuator_telemetry()
+
+                # ----------------------------------------------------
+                # CAMERA TARGET
+                # ----------------------------------------------------
+
+                base_pos, _ = pyb.getBasePositionAndOrientation(
+                    self.robot_id,
+                    physicsClientId=self.client
+                )
+
+                pyb.resetDebugVisualizerCamera(
+                    cameraDistance=self.cam_distance,
+                    cameraYaw=self.cam_yaw,
+                    cameraPitch=self.cam_pitch,
+                    cameraTargetPosition=base_pos,
+                    physicsClientId=self.client
+                )
+
+                # ----------------------------------------------------
+                # 60 Hz CONTROLLER
+                # ----------------------------------------------------
+
+                time.sleep(1.0 / 60.0)
+
+        except KeyboardInterrupt:
+            pass
+
+        finally:
+
+            self.telemetry_stop_event.set()
+
+            if (
+                self.telemetry_plot_process is not None
+                and
+                self.telemetry_plot_process.is_alive()
+            ):
+                self.telemetry_plot_process.join(
+                    timeout=2.0
+                )
+
+            if (
+                self.telemetry_plot_process is not None
+                and
+                self.telemetry_plot_process.is_alive()
+            ):
+                self.telemetry_plot_process.terminate()
+
+                self.telemetry_plot_process.join(
+                    timeout=1.0
+                )
+
+            # Close multiprocessing queues cleanly on Windows
+            try:
+
+                self.telemetry_raw_queue.close()
+                self.telemetry_plot_queue.close()
+
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
+
+    mp.freeze_support()
+
     dog_pilot = PureMathQuadruped()
+
     dog_pilot.run_loop()
