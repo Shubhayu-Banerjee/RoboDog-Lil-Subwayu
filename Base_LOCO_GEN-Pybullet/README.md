@@ -384,4 +384,4 @@ Before transferring it to a physical robot:
 
 ## License
 
-No license is specified in the supplied controller source. Add a license file and update this section if you intend to distribute the project.
+Apache-2.0 license
