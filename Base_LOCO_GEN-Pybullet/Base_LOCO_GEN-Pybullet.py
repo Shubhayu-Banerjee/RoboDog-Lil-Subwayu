@@ -16,7 +16,7 @@ from collections import deque
 # The gait/body height are derived from them automatically.
 # ============================================================
 LEG_THIGH_LENGTH = 0.15   # metres
-LEG_CALF_LENGTH  = 0.21   # metres
+LEG_CALF_LENGTH  = 0.20   # metres
 
 # Desired neutral knee configuration.  This is a joint-space target,
 # so changing leg length does not force the robot into the old stance.
@@ -156,10 +156,19 @@ def actuator_plot_worker(plot_queue, stop_event):
     )
 
     velocity_text = ax.text(
-        30.0, 0.12, "Velocity: 0.00 m/s",
+        30.0, 0.18, "Velocity: 0.00 m/s",
         ha="center", va="center",
         color="white", fontsize=17
     )
+
+    velocity_avg_text = ax.text(
+        30.0, 0.08, "5s Avg: 0.00 m/s",
+        ha="center", va="center",
+        color="#aaaaaa", fontsize=14
+    )
+
+    # Rolling velocity history: (timestamp, velocity)
+    velocity_history = deque()
 
     status_text = ax.text(
         30.0, 0.86, "SAFE",
@@ -183,14 +192,35 @@ def actuator_plot_worker(plot_queue, stop_event):
                 break
 
         if latest is None:
-            return (meter[0], current_text, velocity_text, status_text)
+            return (
+                meter[0],
+                current_text,
+                velocity_text,
+                velocity_avg_text,
+                status_text
+            )
 
         # New format:
         # (timestamp, current, velocity)
-        _, current, velocity = latest
+        timestamp, current, velocity = latest
 
         current = max(0.0, min(60.0, float(current)))
         velocity = max(0.0, float(velocity))
+
+        # Maintain a rolling 5-second velocity window.
+        velocity_history.append((float(timestamp), velocity))
+        cutoff = float(timestamp) - 5.0
+
+        while velocity_history and velocity_history[0][0] < cutoff:
+            velocity_history.popleft()
+
+        if velocity_history:
+            velocity_average = sum(
+                sample_velocity
+                for _, sample_velocity in velocity_history
+            ) / len(velocity_history)
+        else:
+            velocity_average = 0.0
 
         if current >= 45.0:
             state_color = "red"
@@ -207,11 +237,20 @@ def actuator_plot_worker(plot_queue, stop_event):
 
         current_text.set_text(f"{current:.2f} A")
         velocity_text.set_text(f"Velocity: {velocity:.2f} m/s")
+        velocity_avg_text.set_text(
+            f"5s Avg: {velocity_average:.2f} m/s"
+        )
         status_text.set_text(state_text)
         status_text.set_color(state_color)
 
         fig.canvas.draw_idle()
-        return (meter[0], current_text, velocity_text, status_text)
+        return (
+            meter[0],
+            current_text,
+            velocity_text,
+            velocity_avg_text,
+            status_text
+        )
 
     def on_close(_event):
         stop_event.set()
@@ -259,7 +298,7 @@ class PureMathQuadruped:
 
         # Interactive UI Sliders for Body Pose & Height
         self.height_slider = pyb.addUserDebugParameter(
-            "Body Height", -0.25, -0.05, -0.17
+            "Body Height", -0.30, -0.05, -0.17
         )
 
         self.roll_slider = pyb.addUserDebugParameter(
@@ -435,7 +474,7 @@ class PureMathQuadruped:
             )
 
         # Spawn robot
-        start_pos = [0, 0, 0.19]
+        start_pos = [0, 0,0.42]
         start_ori = pyb.getQuaternionFromEuler([0, 0, 0])
 
         self.robot_id = pyb.loadURDF(
