@@ -1,4 +1,4 @@
-# Robo Dog — Contact-Aware CPG Controller
+# Robo Dog - Contact-Aware CPG Controller (Physics Based)
 
 A PyBullet simulation controller for a quadruped robot. The project combines a diagonal Central Pattern Generator (CPG), analytical inverse kinematics (IK), binary foot-contact feedback, keyboard control, body-pose sliders, and a separate actuator telemetry dashboard.
 
