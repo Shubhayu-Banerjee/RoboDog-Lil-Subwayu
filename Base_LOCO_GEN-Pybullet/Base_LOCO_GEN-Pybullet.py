@@ -8,7 +8,27 @@ import threading
 from collections import deque
 
 
+
 # ==================== ACTUATOR TELEMETRY ====================
+# ============================================================
+# ADAPTIVE LEG GEOMETRY
+# Change these two values for different physical leg lengths.
+# The gait/body height are derived from them automatically.
+# ============================================================
+LEG_THIGH_LENGTH = 0.15   # metres
+LEG_CALF_LENGTH  = 0.21   # metres
+
+# Desired neutral knee configuration.  This is a joint-space target,
+# so changing leg length does not force the robot into the old stance.
+NEUTRAL_KNEE_ANGLE = 1.00  # radians
+
+# Fraction of each gait cycle spent in stance.  The remainder is swing.
+STANCE_FRACTION = 0.60
+
+# Keep the original nominal horizontal reach unless the robot geometry
+# itself is changed.
+NOMINAL_FOOT_X = 0.12
+
 ACTUATOR_MAX_TORQUE = 2.45       # N*m (25 kg*cm servo)
 ACTUATOR_MAX_CURRENT = 3.70      # A, maximum/stall current per servo
 SERVO_SUPPLY_VOLTAGE = 6.0       # V, used only for estimated electrical power
@@ -58,7 +78,7 @@ def actuator_calculation_worker(raw_queue, plot_queue, stop_event):
 
     while not stop_event.is_set():
         try:
-            timestamp, torques = raw_queue.get(timeout=0.2)
+            timestamp, torques, velocity = raw_queue.get(timeout=0.2)
         except Exception:
             continue
 
@@ -78,9 +98,11 @@ def actuator_calculation_worker(raw_queue, plot_queue, stop_event):
                 total_current - smooth_current
             )
 
-        # Plot total current directly. This is the requested quantity:
-        # instantaneous aggregate estimated servo current over time.
-        item = (float(timestamp), float(smooth_current), 0.0)
+        item = (
+            float(timestamp),
+            float(smooth_current),
+            float(velocity)
+        )
 
         try:
             plot_queue.put_nowait(item)
@@ -91,74 +113,105 @@ def actuator_calculation_worker(raw_queue, plot_queue, stop_event):
 
 
 def actuator_plot_worker(plot_queue, stop_event):
-    """Dedicated matplotlib process. It never touches PyBullet."""
+    """Dedicated matplotlib dashboard. It never touches PyBullet."""
     import matplotlib
     matplotlib.use("TkAgg")
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
 
-    history = deque()
     plot_period = 1.0 / TELEMETRY_PLOT_HZ
 
     plt.ion()
-    fig, ax = plt.subplots(figsize=(10, 5))
-    fig.canvas.manager.set_window_title("Robo Dog - Total Actuator Current")
+    fig, ax = plt.subplots(figsize=(9, 6), facecolor="black")
+    fig.canvas.manager.set_window_title("Robo Dog - Power & Velocity")
 
-    line, = ax.plot([], [], linewidth=2)
+    ax.set_facecolor("black")
+    ax.set_xlim(0.0, 60.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xticks([0, 15, 30, 45, 60])
+    ax.set_yticks([])
+    ax.set_xlabel("Estimated Total Servo Current (A)",
+                   color="white", fontsize=12)
+    ax.tick_params(axis="x", colors="white")
+    for spine in ax.spines.values():
+        spine.set_color("#555555")
 
-    ax.set_title("Robo Dog — Estimated Total Actuator Current")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Current (A)")
-    ax.grid(True, alpha=0.25)
+    # Threshold regions.
+    ax.axvspan(0, 30, color="green", alpha=0.12)
+    ax.axvspan(30, 45, color="orange", alpha=0.12)
+    ax.axvspan(45, 60, color="red", alpha=0.12)
+    ax.axvline(30, color="orange", linewidth=1.5, alpha=0.8)
+    ax.axvline(45, color="red", linewidth=1.5, alpha=0.8)
 
-    # Keep the window responsive without requiring the simulation thread.
+    # Main current meter.
+    meter = ax.barh(
+        [0.5], [0.0], height=0.55,
+        color="green", edgecolor="white", linewidth=1.2
+    )
+
+    current_text = ax.text(
+        30.0, 0.5, "0.00 A",
+        ha="center", va="center",
+        color="white", fontsize=30, fontweight="bold"
+    )
+
+    velocity_text = ax.text(
+        30.0, 0.12, "Velocity: 0.00 m/s",
+        ha="center", va="center",
+        color="white", fontsize=17
+    )
+
+    status_text = ax.text(
+        30.0, 0.86, "SAFE",
+        ha="center", va="center",
+        color="green", fontsize=15, fontweight="bold"
+    )
+
+    ax.set_title(
+        "ROBO DOG — ACTUATOR POWER",
+        color="white", fontsize=16, fontweight="bold", pad=14
+    )
+
     def update(_frame):
-        received = 0
+        latest = None
 
-        while received < 500:
+        # Drain the queue and keep only the newest telemetry sample.
+        while True:
             try:
-                item = plot_queue.get_nowait()
+                latest = plot_queue.get_nowait()
             except Exception:
                 break
 
-            history.append(item)
-            received += 1
+        if latest is None:
+            return (meter[0], current_text, velocity_text, status_text)
 
-        if not history:
-            return (line,)
+        # New format:
+        # (timestamp, current, velocity)
+        _, current, velocity = latest
 
-        # Keep a rolling time window.
-        newest_t = history[-1][0]
-        cutoff = newest_t - TELEMETRY_HISTORY_SECONDS
+        current = max(0.0, min(60.0, float(current)))
+        velocity = max(0.0, float(velocity))
 
-        while history and history[0][0] < cutoff:
-            history.popleft()
+        if current >= 45.0:
+            state_color = "red"
+            state_text = "HIGH CURRENT"
+        elif current >= 30.0:
+            state_color = "orange"
+            state_text = "WARNING"
+        else:
+            state_color = "green"
+            state_text = "SAFE"
 
-        times = np.fromiter((x[0] for x in history), dtype=float)
-        currents = np.fromiter((x[1] for x in history), dtype=float)
+        meter[0].set_width(current)
+        meter[0].set_color(state_color)
 
-        # Plot relative simulation time so the x-axis stays readable.
-        times = times - times[0]
-
-        line.set_data(times, currents)
-
-        ax.set_xlim(
-            max(0.0, times[-1] - TELEMETRY_HISTORY_SECONDS),
-            max(TELEMETRY_HISTORY_SECONDS, times[-1] + 0.1)
-        )
-
-        ymax = max(float(np.max(currents)) * 1.15, 1.0)
-        ax.set_ylim(0.0, ymax)
-
-        latest_current = history[-1][1]
-
-        ax.set_title(
-            "Robo Dog — Estimated Total Actuator Current\n"
-            f"{latest_current:.2f} A total"
-        )
+        current_text.set_text(f"{current:.2f} A")
+        velocity_text.set_text(f"Velocity: {velocity:.2f} m/s")
+        status_text.set_text(state_text)
+        status_text.set_color(state_color)
 
         fig.canvas.draw_idle()
-        return (line,)
+        return (meter[0], current_text, velocity_text, status_text)
 
     def on_close(_event):
         stop_event.set()
@@ -200,8 +253,8 @@ class PureMathQuadruped:
         )
 
         # Robot Geometry
-        self.l1 = 0.10
-        self.l2 = 0.12
+        self.l1 = LEG_THIGH_LENGTH
+        self.l2 = LEG_CALF_LENGTH
         self.hip_offset_y = 0.055
 
         # Interactive UI Sliders for Body Pose & Height
@@ -219,6 +272,14 @@ class PureMathQuadruped:
 
         self.yaw_slider = pyb.addUserDebugParameter(
             "Static Body Yaw", -0.5, 0.5, 0.0
+        )
+
+        self.x_stride_slider = pyb.addUserDebugParameter(
+            "X Stride (x)", 1.0, 2.0, 1.0
+        )
+
+        self.y_stride_slider = pyb.addUserDebugParameter(
+            "Y Stride (x)", 1.0, 2.0, 1.0
         )
 
         # ==================== CPG ====================
@@ -709,6 +770,32 @@ class PureMathQuadruped:
                 self.gait_state = "STANDING"
                 self.stop_timer = 0.0
 
+    def _foot_trajectory(self, phase):
+        """Generate a length-independent stance/swing foot trajectory.
+
+        The phase is 0..2π.  Stance keeps the foot on the ground while it
+        travels backward; swing smoothly lifts, moves forward, and returns
+        to exactly the ground height.  Because the vertical profile is
+        defined in normalized phase rather than joint angle, changing leg
+        length does not change ground-contact timing.
+        """
+        u = (phase % (2.0 * math.pi)) / (2.0 * math.pi)
+
+        # Stance: foot is planted and moves backward.
+        if u < STANCE_FRACTION:
+            t = u / STANCE_FRACTION
+            x = 1.0 - 2.0 * t
+            z = 0.0
+        else:
+            # Swing: smooth 0 -> 1 -> 0 lift with zero vertical velocity
+            # at both ground-contact events.
+            t = (u - STANCE_FRACTION) / (1.0 - STANCE_FRACTION)
+            s = 0.5 - 0.5 * math.cos(math.pi * t)
+            x = -1.0 + 2.0 * s
+            z = math.sin(math.pi * t) ** 2
+
+        return x, z
+
     def update_gait(self):
         dt = 1.0 / 60.0
 
@@ -791,8 +878,19 @@ class PureMathQuadruped:
         # STRIDE
         # ============================================================
 
-        stride_x = v_x * 0.12
-        stride_y = v_y * 0.10
+        x_stride_scale = float(
+            pyb.readUserDebugParameter(self.x_stride_slider)
+        )
+
+        y_stride_scale = float(
+            pyb.readUserDebugParameter(self.y_stride_slider)
+        )
+
+        x_stride_scale = float(np.clip(x_stride_scale, 1.0, 2.0))
+        y_stride_scale = float(np.clip(y_stride_scale, 1.0, 2.0))
+
+        stride_x = v_x * 0.12 * x_stride_scale
+        stride_y = v_y * 0.10 * y_stride_scale
 
         # IMPORTANT:
         #
@@ -1023,12 +1121,25 @@ class PureMathQuadruped:
                 float(joint_state[3])
             )
 
+        # Actual simulated body velocity, rather than commanded velocity.
+        linear_velocity, _ = pyb.getBaseVelocity(
+            self.robot_id,
+            physicsClientId=self.client
+        )
+
+        # Horizontal ground speed only.
+        velocity = math.sqrt(
+            float(linear_velocity[0]) ** 2 +
+            float(linear_velocity[1]) ** 2
+        )
+
         try:
 
             self.telemetry_raw_queue.put_nowait(
                 (
                     timestamp,
-                    torques
+                    torques,
+                    velocity
                 )
             )
 
