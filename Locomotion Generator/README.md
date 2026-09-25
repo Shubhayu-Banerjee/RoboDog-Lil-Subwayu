@@ -1,4 +1,4 @@
-# Quadruped Robot Simulator
+# Quadruped Robot Visualizer (Non Physics Based)
 
 <img width="1012" height="792" alt="image" src="https://github.com/user-attachments/assets/131b0561-8a97-4138-a94e-0448f07461a7" />
 
