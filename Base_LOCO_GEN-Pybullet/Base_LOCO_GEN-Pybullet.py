@@ -71,6 +71,31 @@ PHASE_RESET_WINDOW = 0.10      # radians
 
 TWO_PI = 2.0 * math.pi
 
+# ==================== CONTACT-AWARE CPG ====================
+# The real robot is intended to use simple digital foot contact
+# switches.  The simulator emulates those switches from collision
+# contacts; no pressure/force information is required.
+FOOT_LINK_INDICES = [2, 5, 8, 11]
+
+# Contact switch debounce.  A switch must agree for this many controller
+# frames before its state is accepted.
+CONTACT_DEBOUNCE_FRAMES = 2
+
+# Local CPG correction limits.  The global diagonal oscillator keeps
+# running; these only bend an individual leg's phase around a fault.
+MAX_PHASE_CORRECTION = 0.55       # radians
+PHASE_CORRECTION_RATE = 8.0       # rad/s
+
+# If a swing leg has not found the ground near the end of swing, lower it
+# slightly and slow its local phase.  This acts like a "search" motion.
+CONTACT_SEARCH_START = 0.78       # normalized swing progress
+MAX_CONTACT_SEARCH_Z = 0.025      # metres
+CONTACT_SEARCH_RATE = 0.10        # metres/s
+
+# If a planted leg unexpectedly loses contact, hold it back in stance
+# rather than allowing the CPG to immediately lift it.
+STANCE_LOST_CONTACT_HOLD = 0.40   # rad/s equivalent phase correction
+
 
 def actuator_calculation_worker(raw_queue, plot_queue, stop_event):
     """Calculate total estimated current/power off the PyBullet thread."""
@@ -325,6 +350,17 @@ class PureMathQuadruped:
         self.cpg_time = 0.0
         self.gait_frequency = 2.0
 
+        # Per-leg contact-aware correction layered on top of the global CPG.
+        self.leg_phase_correction = np.zeros(4, dtype=np.float64)
+        self.leg_contact = np.zeros(4, dtype=bool)
+        self.leg_contact_raw = np.zeros(4, dtype=bool)
+        self.leg_contact_stable_frames = np.zeros(4, dtype=np.int32)
+        self.leg_search_z = np.zeros(4, dtype=np.float64)
+        self.leg_contact_fault = ["OK"] * 4
+
+        # Terrain bodies used by the simulated contact switches.
+        self.terrain_ids = set()
+
         # ==================== CPG ====================
         self.cpg_time = 0.0
         self.gait_frequency = 2.0
@@ -434,6 +470,8 @@ class PureMathQuadruped:
             {"size": [2.0, 0.8, 0.60], "pos": [1.3, -2.0, 0.0]}
         ]
 
+        self.ramp_ids = []
+
         for config in ramps_config:
             l, w, h = config["size"]
 
@@ -466,12 +504,16 @@ class PureMathQuadruped:
                 physicsClientId=self.client
             )
 
+            self.ramp_ids.append(ramp_id)
+
             pyb.changeDynamics(
                 ramp_id,
                 -1,
                 lateralFriction=2.5,
                 physicsClientId=self.client
             )
+
+        self.terrain_ids = {self.plane_id, *self.ramp_ids}
 
         # Spawn robot
         start_pos = [0, 0,0.42]
@@ -809,6 +851,181 @@ class PureMathQuadruped:
                 self.gait_state = "STANDING"
                 self.stop_timer = 0.0
 
+    def _read_foot_contact_switches(self):
+        """Read four binary foot-contact switches.
+
+        In simulation, each switch is emulated by a collision on the final
+        leg link.  On the physical robot this method can be replaced by four
+        GPIO reads without changing the CPG feedback logic.
+
+        No pressure magnitude is used anywhere: contact is simply TRUE/FALSE.
+        """
+        raw = np.zeros(4, dtype=bool)
+
+        # Query only contacts involving the robot.  We accept the plane and
+        # every ramp as terrain.  The normal-Z check rejects side collisions.
+        contacts = pyb.getContactPoints(
+            bodyA=self.robot_id,
+            physicsClientId=self.client
+        )
+
+        for cp in contacts:
+            link_index = cp[3]
+            body_b = cp[2]
+
+            if link_index not in FOOT_LINK_INDICES:
+                continue
+
+            if body_b not in self.terrain_ids:
+                continue
+
+            # Contact normal points from body B toward body A.  A positive
+            # Z component means the foot is supported from below.
+            normal = cp[7]  # (normal_x, normal_y, normal_z)
+            normal_z = normal[2]
+            if normal_z < 0.35:
+                continue
+
+            leg = FOOT_LINK_INDICES.index(link_index)
+            raw[leg] = True
+
+        # Debounce exactly like a real mechanical switch would need.
+        for i in range(4):
+            if raw[i] == self.leg_contact_raw[i]:
+                self.leg_contact_stable_frames[i] += 1
+            else:
+                self.leg_contact_raw[i] = raw[i]
+                self.leg_contact_stable_frames[i] = 1
+
+            if self.leg_contact_stable_frames[i] >= CONTACT_DEBOUNCE_FRAMES:
+                self.leg_contact[i] = raw[i]
+
+        return self.leg_contact.copy()
+
+    @staticmethod
+    def _phase_to_unit(phase):
+        return (phase % TWO_PI) / TWO_PI
+
+    @staticmethod
+    def _phase_error(target, current):
+        """Shortest signed phase error, in radians."""
+        return (target - current + math.pi) % TWO_PI - math.pi
+
+    def _update_contact_feedback(self, nominal_phases, dt):
+        """Apply local contact feedback without replacing the global CPG.
+
+        The global oscillator still provides the diagonal rhythm.  Each leg
+        gets a small local phase correction:
+
+          * early contact during swing -> finish swing immediately and enter
+            stance;
+          * late/missed touchdown -> slow/hold the local leg and lower it;
+          * contact lost during stance -> temporarily hold the leg planted;
+          * once contact is recovered -> smoothly release the correction.
+
+        This is deliberately switch-based, not pressure-based.
+        """
+        contacts = self._read_foot_contact_switches()
+        corrected_phases = []
+
+        swing_boundary = TWO_PI * STANCE_FRACTION
+
+        for i in range(4):
+            local_phase = (
+                nominal_phases[i] +
+                self.leg_phase_correction[i]
+            )
+            u = self._phase_to_unit(local_phase)
+
+            in_swing = u >= STANCE_FRACTION
+
+            if in_swing:
+                swing_t = (
+                    u - STANCE_FRACTION
+                ) / (1.0 - STANCE_FRACTION)
+
+                if contacts[i]:
+                    # We touched down before the nominal end of swing.
+                    # Pull the local phase toward the start of stance.
+                    error = self._phase_error(
+                        swing_boundary,
+                        local_phase % TWO_PI
+                    )
+
+                    self.leg_phase_correction[i] += np.clip(
+                        error,
+                        -PHASE_CORRECTION_RATE * dt,
+                        PHASE_CORRECTION_RATE * dt
+                    )
+
+                    self.leg_search_z[i] *= max(
+                        0.0,
+                        1.0 - 12.0 * dt
+                    )
+                    self.leg_contact_fault[i] = "EARLY CONTACT"
+
+                elif swing_t >= CONTACT_SEARCH_START:
+                    # Missed touchdown: keep this leg locally behind the
+                    # global oscillator and lower it gently until the switch
+                    # closes.  This is the key recovery behavior.
+                    self.leg_phase_correction[i] -= min(
+                        PHASE_CORRECTION_RATE * dt,
+                        0.08
+                    )
+                    self.leg_phase_correction[i] = max(
+                        -MAX_PHASE_CORRECTION,
+                        self.leg_phase_correction[i]
+                    )
+
+                    self.leg_search_z[i] = max(
+                        -MAX_CONTACT_SEARCH_Z,
+                        self.leg_search_z[i] -
+                        CONTACT_SEARCH_RATE * dt
+                    )
+                    self.leg_contact_fault[i] = "SEARCHING"
+
+                else:
+                    self.leg_contact_fault[i] = "SWING"
+
+            else:
+                # During stance, contact is expected.  If it disappears,
+                # bias the leg backwards in phase so the CPG does not lift
+                # it immediately.
+                self.leg_search_z[i] *= max(
+                    0.0,
+                    1.0 - 15.0 * dt
+                )
+
+                if contacts[i]:
+                    # Slowly release old correction after stable contact.
+                    self.leg_phase_correction[i] *= max(
+                        0.0,
+                        1.0 - 2.5 * dt
+                    )
+                    self.leg_contact_fault[i] = "STANCE"
+                else:
+                    self.leg_phase_correction[i] -= (
+                        STANCE_LOST_CONTACT_HOLD * dt
+                    )
+                    self.leg_phase_correction[i] = max(
+                        -MAX_PHASE_CORRECTION,
+                        self.leg_phase_correction[i]
+                    )
+                    self.leg_contact_fault[i] = "STANCE LOST"
+
+            self.leg_phase_correction[i] = float(np.clip(
+                self.leg_phase_correction[i],
+                -MAX_PHASE_CORRECTION,
+                MAX_PHASE_CORRECTION
+            ))
+
+            corrected_phases.append(
+                nominal_phases[i] +
+                self.leg_phase_correction[i]
+            )
+
+        return corrected_phases
+
     def _foot_trajectory(self, phase):
         """Generate a length-independent stance/swing foot trajectory.
 
@@ -905,9 +1122,14 @@ class PureMathQuadruped:
         # ============================================================
 
         if self.jump_state == "GROUNDED":
-            v_x = float(self.active_command[0])
-            v_y = float(self.active_command[1])
-            w_yaw = float(self.active_command[2])
+            # Restore the original user-facing control directions.  The
+            # stance/swing foot trajectory uses the opposite sign convention
+            # from the previous open-loop trajectory, so invert the three
+            # command channels here (and nowhere in the contact-feedback
+            # or CPG phase logic).
+            v_x = -float(self.active_command[0])
+            v_y = -float(self.active_command[1])
+            w_yaw = -float(self.active_command[2])
         else:
             v_x = 0.0
             v_y = 0.0
@@ -944,12 +1166,19 @@ class PureMathQuadruped:
         # DIAGONAL CPG
         # ============================================================
 
-        phases = [
+        nominal_phases = [
             phase,
             phase + math.pi,
             phase + math.pi,
             phase
         ]
+
+        # Contact switches provide a local feedback layer around the global
+        # diagonal CPG.  The oscillator itself never stops.
+        phases = self._update_contact_feedback(
+            nominal_phases,
+            dt
+        )
 
         base_x = [
             0.12,
@@ -974,29 +1203,32 @@ class PureMathQuadruped:
             p = phases[i]
 
             # --------------------------------------------------------
-            # HORIZONTAL CPG MOTION
+            # CONTACT-AWARE NOMINAL FOOT TRAJECTORY
             # --------------------------------------------------------
+            #
+            # This is the stance/swing trajectory that was already present
+            # in _foot_trajectory(), now actually used by the CPG.
+            #
+            # x_norm:
+            #   +1 -> -1 during stance (planted, moving backward)
+            #   -1 -> +1 during swing (foot moves forward)
+            #
+            # z_norm:
+            #   0 on the ground, smooth positive lift during swing.
+            #
+            x_norm, z_norm = self._foot_trajectory(p)
+
+            x_step = stride_x * x_norm
+            y_step = stride_y * x_norm
+
+            # Dynamic vertical search correction is generated by the binary
+            # contact feedback loop.  No pressure measurement is needed.
+            z_step = (
+                step_height * z_norm
+                + self.leg_search_z[i]
+            )
 
             cos_p = math.cos(p)
-            sin_p = math.sin(p)
-
-            x_step = stride_x * cos_p
-            y_step = stride_y * cos_p
-
-            # --------------------------------------------------------
-            # SWING TRAJECTORY
-            # --------------------------------------------------------
-            #
-            # Still using your original positive-half sine trajectory.
-            # Phase 1-3 intentionally does NOT replace the CPG here.
-            #
-            # The difference is that step_height itself is now smooth.
-            #
-
-            z_step = step_height * max(
-                0.0,
-                sin_p
-            )
 
             # --------------------------------------------------------
             # DYNAMIC YAW
@@ -1009,14 +1241,14 @@ class PureMathQuadruped:
                 w_yaw *
                 dynamic_yaw_rx *
                 0.4 *
-                cos_p
+                x_norm
             )
 
             y_step += (
                 w_yaw *
                 dynamic_yaw_ry *
                 0.4 *
-                cos_p
+                x_norm
             )
 
             # --------------------------------------------------------
